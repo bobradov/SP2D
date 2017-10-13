@@ -1,0 +1,230 @@
+#!/home/d.palle/localApps/Enthought/Canopy_64bit/User/bin/python
+
+import valley as valley
+import SP2D as sp2d
+import Zoner   as zoner
+import FDMesh  as fdmesh
+import FVMMesh as FVM
+import FVMPoisson  as pois
+import numpy  as np
+import phys
+
+import scipy.sparse.linalg as la_sparse
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+np.set_printoptions(threshold='nan')
+np.set_printoptions(precision=3)
+np.set_printoptions(linewidth=300)
+
+
+L = 5.0
+W = 5.0
+IL = 0.5
+
+# grid
+nx = 30
+ny = 30
+nh = 20
+nv = 15
+no = 5
+fdmesh = fdmesh.FDMesh(L, W, nx, ny)
+
+# Surounding oxide
+Eps_HiK  = 22.0
+EOT = 0.85
+vsp = 2.0
+hsp = IL + (EOT-IL)*Eps_HiK/3.9
+
+pgaa_zoner = zoner.pGAAZoner(L, W, fdmesh, 
+							vsp, hsp, nh, nv, no, 
+							IL=IL, Eps_HiK=Eps_HiK)
+
+
+mesh = FVM.FVMMesh( pgaa_zoner.getXMesh(), 
+					pgaa_zoner.getYMesh(),
+					pgaa_zoner.zoner_func, 
+					pgaa_zoner.prop_dict ) 
+			
+mesh.assignContact( lambda x, y: x < -hsp + 1e-8,   'Left' )
+mesh.assignContact( lambda x, y: x >  L+hsp-1e-8, 'Right')
+					
+#print(mesh)
+
+#exit()
+
+poisson = pois.FVMPoisson(mesh)
+
+#print 'Lap mat:'
+pmat =  poisson.Lap_mat
+#print pmat.toarray()
+
+
+# Now build rhs mat
+bc_val_dict = { 'Left' : 0.7, 'Right' : 0.7 }
+peak = 8e19
+xc = L/2.0
+yc = W/2.0
+rhs = poisson.buildRHS(
+	bc_val_dict, 
+	charge_func=lambda x, y : peak * np.exp(-(x-xc)*(x-xc)/(L*L) -(y-yc)*(y-yc)/(W*W))
+)
+#print 'RHS: ', rhs
+print 'RHS shape: ', rhs.shape
+print 'Poisson shape: ', pmat.shape
+
+
+# Solve the resulting system
+potential_solution = la_sparse.spsolve(pmat, rhs)
+
+(X, Y, Z) = poisson.pmesh.mapSolutionToGrid(potential_solution)
+
+
+# Make some plots
+
+
+fig = plt.figure()
+ax = fig.add_subplot(121, aspect='equal')
+levels = np.linspace(np.amin(Z), np.amax(Z), 30)
+cp = plt.contourf(X, Y, Z, levels=levels)
+plt.contour(X, Y, Z, levels=levels, linewidths=0.5, colors='k')
+plt.colorbar(cp)
+plt.xlabel('X [nm]')
+plt.ylabel('Y [nm]')	
+
+
+ax.add_patch(
+    patches.Rectangle(
+        (0.0, 0.0),
+        L,
+        W,
+        fill=False,      # remove background
+        linewidth=2
+    )
+)
+
+ax.add_patch(
+    patches.Rectangle(
+        (-IL, -IL),
+        L+2*IL,
+        W+2*IL,
+        fill=False,      # remove background
+        linewidth=2
+    )
+)
+
+
+#plt.show()	
+
+
+
+
+#
+# Schroedinger part
+#
+# Create Delta4 Valleys
+mstar = np.array([[0.315, 0.478, 0],[0.478, 0.19, 0],[0, 0, 0.315]])
+mult  = 2
+Delta4L = valley.valley('Delta4L', L, W, mstar, mult)
+
+mstar = np.array([[0.315, -0.478, 0],[-0.478, 0.19, 0],[0, 0, 0.315]])
+mult  = 2
+Delta4R = valley.valley('Delta4R', L, W, mstar, mult)
+
+# Create Delta2 Valley
+mstar = np.array([[0.19, 0, 0],[0, 0.92, 0],[0, 0, 0.19]])
+mult = 2
+Delta2 = valley.valley('Delta2', L, W, mstar, mult)
+
+# Create Schroedinger-Poisson Solver
+# Include all valleys
+print 'Constructing solver ...'
+sp = sp2d.SP2D([Delta4L, Delta4R, Delta2], fdmesh)
+
+
+n_eigen = 20
+
+# Now solve system
+# Need to map the potential_solution to a CB function
+poisson.pmesh.loadAccumulator(potential_solution)
+cbfun = lambda x, y: -1.0*poisson.pmesh.nn_interp(x, y)
+print 'Starting eigensolve ...'
+sp.solveWithCB(cbfun, n_eigen=n_eigen)
+
+Ef = 0.0
+
+# Build charge density
+val_dict = sp.getSolution(0)
+(X,Y,Z) = val_dict['wfns']
+ZCharge = sp.computeChargeDensity(Ef)
+		
+# Now plot the accumulated charge density
+'''
+plt.figure()
+levels = np.linspace(np.amin(ZCharge), np.amax(ZCharge), 30)
+cp = plt.contourf(X, Y, ZCharge, levels=levels)
+plt.colorbar(cp)
+plt.xlabel('X [nm]')
+plt.ylabel('Y [nm]')	
+'''
+ax2 = fig.add_subplot(122, aspect='equal')
+levels_c = np.linspace(np.amin(ZCharge), np.amax(ZCharge), 30)
+cp = plt.contourf(X, Y, ZCharge, levels=levels_c)
+#plt.contour(X, Y, ZCharge, levels=levels_c, linewidths=0.5, colors='k')
+plt.colorbar(cp)
+plt.xlabel('X [nm]')
+plt.ylabel('Y [nm]')
+
+
+#plt.show()
+
+print 'Re-solving system:'
+
+# Now re-solve Poisson with the new charge
+csemi_array = np.reshape(ZCharge, nx*ny)
+fdmesh.loadAccumulator(csemi_array)
+rhs = poisson.buildRHS(
+	bc_val_dict, 
+	charge_grid=fdmesh
+)
+
+# Solve the resulting system
+z = la_sparse.spsolve(pmat, rhs)
+(X, Y, Z) = poisson.pmesh.mapSolutionToGrid(z)
+print 'Done re-solving.'
+
+fig = plt.figure()
+ax = fig.add_subplot(111, aspect='equal')
+levels = np.linspace(np.amin(Z), np.amax(Z), 30)
+cp = plt.contourf(X, Y, Z, levels=levels)
+plt.contour(X, Y, Z, levels=levels, linewidths=0.5, colors='k')
+plt.colorbar(cp)
+plt.xlabel('X [nm]')
+plt.ylabel('Y [nm]')	
+
+
+ax.add_patch(
+    patches.Rectangle(
+        (0.0, 0.0),
+        L,
+        W,
+        fill=False,      # remove background
+        linewidth=2
+    )
+)
+
+ax.add_patch(
+    patches.Rectangle(
+        (-IL, -IL),
+        L+2*IL,
+        W+2*IL,
+        fill=False,      # remove background
+        linewidth=2
+    )
+)
+
+plt.show()
+
+
+
+

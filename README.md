@@ -1,2 +1,2 @@
+SP2D-git
 # SP2D
-Schroedinger-Poisson Method for FET Modeling
